@@ -6,7 +6,7 @@ name: CI Windows Cross-Build
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, niu/verify-windows-ci]
   pull_request:
     paths:
       - 'internal/edgeagent/**'
