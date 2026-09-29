@@ -26,13 +26,14 @@ node:
   collectorMode: "off"
   tolerations:
     - operator: Exists
+  # Shared by the node Edge and all collector/OBI subprocesses.
   resources:
     requests:
       cpu: 50m
       memory: 128Mi
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "4"
+      memory: 8Gi
 
 controller:
   replicas: 1
@@ -61,8 +62,8 @@ controller:
       cpu: 50m
       memory: 128Mi
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "2"
+      memory: 4Gi
 
 kubeStateMetrics:
   enabled: true
@@ -81,8 +82,8 @@ kubeStateMetrics:
       cpu: 20m
       memory: 64Mi
     limits:
-      cpu: 200m
-      memory: 256Mi
+      cpu: "2"
+      memory: 4Gi
 
 telemetryConfig:
   # Controller republishes endpoint/auth/TLS changes to the projected Secret;
@@ -120,8 +121,8 @@ kubernetesMetrics:
       cpu: 100m
       memory: 128Mi
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "4"
+      memory: 8Gi
 
 upgrade:
   # A pre-upgrade Helm hook performs any live hand-off that cannot be made
@@ -142,9 +143,6 @@ telemetryGateway:
   replicas: 2
   serviceAccountName: ""
   reloadInterval: 10s
-  memoryLimiter:
-    limitMiB: 768
-    spikeLimitMiB: 128
   batch:
     sendSize: 2048
     maxSize: 4096
@@ -154,8 +152,8 @@ telemetryGateway:
       cpu: 200m
       memory: 256Mi
     limits:
-      cpu: 1000m
-      memory: 1Gi
+      cpu: "4"
+      memory: 8Gi
   autoscaling:
     # Requires the standard metrics.k8s.io API (normally provided by
     # metrics-server). Disable this flag to fall back to a fixed replica count
@@ -163,10 +161,12 @@ telemetryGateway:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
-    targetCPUUtilizationPercentage: 60
-    # Keep the target at no more than 80% of memory_limiter's 640Mi soft limit
-    # (768Mi - 128Mi spike), leaving headroom for HPA tolerance and sampling lag.
-    targetMemoryAverageValue: 512Mi
+    # 300% of the 200m request targets 600m CPU per Pod; this is not a limit.
+    # Tune together with CPU requests. Explicit legacy percentages still win.
+    targetCPUUtilizationPercentage: 300
+    # Null scales at half the container memory limit (4Gi by default), leaving
+    # room for bursts. Existing explicit targets remain valid overrides.
+    targetMemoryAverageValue: null
     scaleDownStabilizationWindowSeconds: 300
     # Drain in-memory telemetry gradually after the stabilization window.
     scaleDownMaxPods: 1

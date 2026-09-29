@@ -38,6 +38,58 @@ fixed diagnostics listeners and HTTP probes. Logs, OBI, OTLP, pprof, and exporte
 listeners are not changed by this fallback. If automatic allocation also fails,
 startup fails with the bind errors; no existing process is stopped or reused.
 
+## Kubernetes resource budgets
+
+Each Edge container and its subprocesses share one CPU/memory budget. Auto APM,
+logs, traces, and Gateway Collectors have no independent memory limiter;
+legacy Collector memory settings are ignored. Batches, exporter queues, retry
+policies, and log checkpoints remain bounded as before.
+
+Chart defaults below are per container. They are a starting configuration for
+dozens of nodes and around a thousand Pods, not a load-tested capacity guarantee.
+
+| Component | CPU / memory request | CPU / memory limit | Replicas |
+| --- | --- | --- | --- |
+| Node Edge (including OBI and all node Collectors) | 50m / 128Mi | 4 / 8Gi | One per node |
+| Telemetry Gateway | 200m / 256Mi | 4 / 8Gi | HPA 2–10 |
+| Kubernetes metrics Scraper | 100m / 128Mi | 4 / 8Gi | 1 |
+| Controller | 50m / 128Mi | 2 / 4Gi | 1 |
+| kube-state-metrics | 20m / 64Mi | 2 / 4Gi | 1 |
+
+Requests retain the lightweight defaults; raise them to measured sustained usage
+on busy clusters. They affect scheduling and resource contention; limits are
+ceilings, not reserved capacity. Existing explicit Helm resource overrides win;
+when retaining smaller limits, also keep requests at or below those limits.
+Ordinary host installs need systemd resource limits to enforce an overall cap.
+
+Gateway HPA requires metrics-server. Its default memory target is half the
+container limit (4Gi), and CPU utilization is 300% of the CPU **request**
+(200m × 300% = 600m per Pod). Tune the percentage together with CPU requests;
+explicit legacy percentages are preserved. Kubernetes permits CPU utilization
+targets above 100% because requests are not CPU ceilings.
+Explicit memory targets are preserved and must stay at or below 80% of the container
+limit. Collectors can still be OOM-killed during bursts; removing their memory
+limiter trades early backpressure for reliance on the container's OOM boundary.
+
+Validate with actual log bytes/s, spans/s, active series, queue occupancy,
+scrape duration, CPU throttling and memory usage. Gateway can scale horizontally;
+the current Scraper is single-active and kube-state-metrics is unsharded. Do not
+replicate scrapers without target partitioning. An overloaded Manager or storage
+backend needs its own capacity work; raising Edge limits will not fix it. See
+[Collector scaling](https://opentelemetry.io/docs/collector/scaling/) and
+[kube-state-metrics scaling](https://github.com/kubernetes/kube-state-metrics#scaling-kube-state-metrics).
+
+Auto APM has no per-scrape sample count limit and sends at most 1,000 samples
+per tunnel request. A complete scrape is still held in Edge memory for resource
+enrichment. HTTP scraping has a 10s timeout; resource enrichment and all batches
+share one 60s push budget. Scrapes remain serial, and stopping the plugin cancels
+an in-flight push. Other custom metrics targets retain the 15s default push
+timeout, configurable per target with `push_timeout`. The container resource
+budget still applies.
+The separate cluster metrics scraper defaults to 250,000 samples per target.
+Roll back both the Edge image and Chart to restore the previous Collector policy
+and resource defaults.
+
 ## Batch install (non-Kubernetes fleets)
 
 Open **Devices → Batch install** to create a bounded installation profile. A profile can either be:
