@@ -164,20 +164,132 @@ func TestBashTool_DockerCleanupCommandUsesApprovalInsteadOfDispatch(t *testing.T
 	}
 }
 
-func TestBashTool_ReadCommandWithShellSyntaxDoesNotUseApproval(t *testing.T) {
-	fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: false, Reason: "unsupported shell operator"})}
-	prop := &recHostBashProposer{}
-	tool := &BashTool{caller: fc, resolver: &fakeHostFilesResolver{mapping: map[uint64]uint64{1: 7}}, proposer: prop}
-	ctx := basetool.WithHostWriteAllowed(context.Background(), true)
-	_, err := tool.InvokableRun(ctx, `{"device_ids":[1],"cmd":"docker system df 2>/dev/null && echo \"---\""}`)
-	if err != nil {
-		t.Fatalf("InvokableRun: %v", err)
+// Issue #337：重定向与命令列表不能只看首命令名。这类语法必须进提案确认；
+// 旧实现把它当成读命令直接下发，并在写动作开关打开时带上 Unrestricted。
+func TestBashTool_RedirectAndCommandListUseApproval(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+	}{
+		{"redirect with list", `docker system df 2>/dev/null && echo \"---\"`},
+		{"write after list", "ls -l && rm -f /tmp/x"},
+		{"write inside pipeline", "cat /etc/hosts | tee /tmp/hosts.copy"},
+		{"command substitution", "echo $(rm -f /tmp/y)"},
+		{"write with env prefix", "LC_ALL=C mv /tmp/a /tmp/b"},
+		{"write under sudo options", "sudo -u nginx rm -f /var/cache/index.html"},
 	}
-	if prop.called {
-		t.Fatalf("read command with unsupported shell syntax should be handled by cmdpolicy, not approval")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: false, Reason: "unsupported shell operator"})}
+			prop := &recHostBashProposer{}
+			tool := &BashTool{caller: fc, resolver: &fakeHostFilesResolver{mapping: map[uint64]uint64{1: 7}}, proposer: prop}
+			ctx := basetool.WithHostWriteAllowed(context.Background(), true)
+			payload, err := json.Marshal(map[string]any{"device_ids": []uint64{1}, "cmd": tc.cmd})
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			if _, err := tool.InvokableRun(ctx, string(payload)); err != nil {
+				t.Fatalf("InvokableRun: %v", err)
+			}
+			if !prop.called {
+				t.Fatalf("%q must create an approval proposal", tc.cmd)
+			}
+			if prop.command != tc.cmd {
+				t.Fatalf("proposal carried %q, want the exact command %q", prop.command, tc.cmd)
+			}
+			if fc.lastName != "" {
+				t.Fatalf("%q dispatched before approval, method %q", tc.cmd, fc.lastName)
+			}
+		})
 	}
-	if fc.lastName != tunnel.MethodBashExec {
-		t.Fatalf("expected direct bash dispatch, got %q", fc.lastName)
+}
+
+// 纯读的命令列表与管道不应该被拖进审批；同时验证下发一律是只读模式。
+func TestBashTool_ReadPipelineDispatchesReadOnly(t *testing.T) {
+	for _, cmd := range []string{"ps aux | grep ongrid", "df -h && free -m", "docker images | head -5"} {
+		t.Run(cmd, func(t *testing.T) {
+			fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: true, Stdout: "ok"})}
+			prop := &recHostBashProposer{}
+			tool := &BashTool{caller: fc, resolver: &fakeHostFilesResolver{mapping: map[uint64]uint64{1: 7}}, proposer: prop}
+			ctx := basetool.WithHostWriteAllowed(context.Background(), true)
+			payload, err := json.Marshal(map[string]any{"device_ids": []uint64{1}, "cmd": cmd})
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			if _, err := tool.InvokableRun(ctx, string(payload)); err != nil {
+				t.Fatalf("InvokableRun: %v", err)
+			}
+			if prop.called {
+				t.Fatalf("read-only pipeline should not require approval: %q", cmd)
+			}
+			if fc.lastName != tunnel.MethodBashExec {
+				t.Fatalf("expected direct bash dispatch, got %q", fc.lastName)
+			}
+			var req tunnel.BashExecRequest
+			if err := json.Unmarshal(fc.lastBody, &req); err != nil {
+				t.Fatalf("decode req: %v", err)
+			}
+			if req.Unrestricted {
+				t.Fatalf("read command must dispatch in read-only mode even with the write gate on: %q", cmd)
+			}
+		})
+	}
+}
+
+func TestIsHostBashWriteCommand(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want bool
+	}{
+		// 首命令判断本来就覆盖的
+		{"rm /tmp/a", true},
+		{"sudo rm /tmp/a", true},
+		{"/usr/bin/touch /tmp/a", true},
+		{"docker system prune -af", true},
+		{"systemctl restart ongrid-edge", true},
+		{"df -h", false},
+		{"docker images", false},
+		{"systemctl status ongrid-edge", false},
+		// 重定向：目标文件一定被改
+		{"echo hi > /etc/hosts", true},
+		{"echo hi >> /var/log/app.log", true},
+		{"cat f 2>/dev/null", true},
+		{"make target >&2", true},
+		// 命令列表 / 后台执行：每个段都要判
+		{"ls; rm -f /tmp/x", true},
+		{"true && rm -f /tmp/x", true},
+		{"rm -f /tmp/x || true", true},
+		{"sleep 5 &", false},
+		{"ls -l & rm /tmp/x", true},
+		// 管道里的写命令
+		{"cat /etc/hosts | tee /tmp/copy", true},
+		{"ps aux | head -5", false},
+		// 命令替换：内容不可预测
+		{"echo $(rm -f /tmp/y)", true},
+		{"echo `rm -f /tmp/y`", true},
+		{"echo \"$(whoami)\"", true},
+		// 引号内是字面量，不能当成语法（否则读命令被无谓拖进审批）
+		{`echo "a > b"`, false},
+		{`echo 'a; rm b'`, false},
+		{`echo "hello && world"`, false},
+		// 前导赋值与 sudo 选项不能顶掉命令名
+		{"LC_ALL=C rm -f /tmp/x", true},
+		{"FOO=1 BAR=2 mv a b", true},
+		{"LC_ALL=C df -h", false},
+		{"sudo -u nginx rm -f /tmp/x", true},
+		{"sudo -n systemctl stop firewalld", true},
+		{"sudo -- rm -f /tmp/x", true},
+		{"sudo -u nginx df -h", false},
+		// 空输入
+		{"", false},
+		{"   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			if got := isHostBashWriteCommand(tc.cmd); got != tc.want {
+				t.Fatalf("isHostBashWriteCommand(%q) = %v, want %v", tc.cmd, got, tc.want)
+			}
+		})
 	}
 }
 

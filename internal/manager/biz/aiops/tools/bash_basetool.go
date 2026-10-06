@@ -370,16 +370,97 @@ func marshalBashEnvelope(cmd string, results []BashResultEntry) (string, error) 
 	return string(out), nil
 }
 
+// isHostBashWriteCommand 判定一条命令是否可能改动作主机。它只做保守分流：
+// 判成写就走提案确认，判成读也只是以只读模式下发，最终仍由 Edge 的 cmdpolicy
+// 决定。因此这里宁可多报，不可漏报。
 func isHostBashWriteCommand(cmd string) bool {
-	fields := strings.Fields(strings.TrimSpace(cmd))
+	segments, risky := splitHostShellCommands(cmd)
+	if risky {
+		return true
+	}
+	for _, segment := range segments {
+		if hostSegmentIsWrite(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHostShellCommands 按 shell 分隔符把命令切成多个简单命令段，并报告是否
+// 出现输出重定向或命令替换。这两类语法本身就足以产生任意副作用，无法靠命令名
+// 判断。引号内的分隔符不算语法：单引号内是字面量；双引号内的 $( ) 与反引号仍会
+// 执行，所以按风险处理。
+func splitHostShellCommands(cmd string) ([]string, bool) {
+	var segments []string
+	var buf []rune
+	risky := false
+	flush := func() {
+		if s := strings.TrimSpace(string(buf)); s != "" {
+			segments = append(segments, s)
+		}
+		buf = buf[:0]
+	}
+	runes := []rune(cmd)
+	inSingle, inDouble := false, false
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if c == '\\' && i+1 < len(runes) {
+			buf = append(buf, runes[i+1])
+			i++
+			continue
+		}
+		// 命令替换在双引号内同样会执行。
+		if c == '`' || (c == '$' && i+1 < len(runes) && runes[i+1] == '(') {
+			risky = true
+		}
+		if inDouble {
+			if c == '"' {
+				inDouble = false
+			}
+			buf = append(buf, c)
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ';', '\n':
+			flush()
+		case '|', '&':
+			// 吃掉 && 与 || 的第二个字符，避免多切出一个空段。
+			if i+1 < len(runes) && runes[i+1] == c {
+				i++
+			}
+			flush()
+		case '>':
+			risky = true
+			flush()
+		case '<':
+			flush()
+		default:
+			buf = append(buf, c)
+		}
+	}
+	flush()
+	return segments, risky
+}
+
+// hostSegmentIsWrite 对一个简单命令段做原来的首命令判断。
+func hostSegmentIsWrite(segment string) bool {
+	fields := dropHostEnvAssignments(strings.Fields(segment))
+	fields = dropHostSudo(fields)
 	if len(fields) == 0 {
 		return false
 	}
 	writeBins := []string{"rm", "mv", "cp", "chmod", "chown", "dd", "truncate", "tee", "mkdir", "rmdir", "touch", "ln"}
 	first := fields[0]
-	if first == "sudo" && len(fields) > 1 {
-		first = fields[1]
-	}
 	if slash := strings.LastIndex(first, "/"); slash >= 0 {
 		first = first[slash+1:]
 	}
@@ -398,6 +479,58 @@ func isHostBashWriteCommand(cmd string) bool {
 		}
 	}
 	return false
+}
+
+// dropHostEnvAssignments 去掉前导的 NAME=value。`LC_ALL=C rm -f x` 的首词是
+// 赋值而不是命令名，不剥掉就会把写命令漏判成读命令。
+func dropHostEnvAssignments(fields []string) []string {
+	for len(fields) > 0 && isHostEnvAssignment(fields[0]) {
+		fields = fields[1:]
+	}
+	return fields
+}
+
+func isHostEnvAssignment(token string) bool {
+	i := strings.Index(token, "=")
+	if i <= 0 {
+		return false
+	}
+	for j, r := range token[:i] {
+		switch {
+		case r == '_':
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+			if j == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// dropHostSudo 跳过 sudo 自身、它的前导选项以及带值选项的参数。只取 fields[1]
+// 的话 `sudo -u nginx rm -f x` 会把 -u 当成命令名而漏判。
+func dropHostSudo(fields []string) []string {
+	if len(fields) == 0 || fields[0] != "sudo" {
+		return fields
+	}
+	fields = fields[1:]
+	for len(fields) > 0 && len(fields[0]) > 1 && strings.HasPrefix(fields[0], "-") && fields[0] != "--" {
+		switch fields[0] {
+		case "-u", "-g", "-C", "-D", "-p", "-r", "-t":
+			fields = fields[1:]
+			if len(fields) == 0 {
+				return fields
+			}
+		}
+		fields = fields[1:]
+	}
+	if len(fields) > 0 && fields[0] == "--" {
+		fields = fields[1:]
+	}
+	return fields
 }
 
 func isDockerWriteCommand(args []string) bool {
