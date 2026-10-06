@@ -77,7 +77,10 @@ func TestBashTool_LegacyDeviceIDRunsReadOnly(t *testing.T) {
 	}
 }
 
-func TestBashTool_AdminWriteGateBypassesReadOnlyPolicyForReadCommand(t *testing.T) {
+// Issue #337：写动作开关只解锁"生成提案"这一件事。分类器判定为读的命令
+// 仍必须以只读模式下发，这样万一漏判，Edge 的 cmdpolicy 会拒绝它，而不是
+// 拿到 unrestricted 直接跑原始命令。
+func TestBashTool_AdminWriteGateKeepsReadCommandOnReadOnlyPath(t *testing.T) {
 	fc := &fakeCaller{
 		respBody: mustMarshal(tunnel.BashExecResponse{Allowed: true, Stdout: "repo\ttag"}),
 	}
@@ -92,8 +95,8 @@ func TestBashTool_AdminWriteGateBypassesReadOnlyPolicyForReadCommand(t *testing.
 	if err := json.Unmarshal(fc.lastBody, &req); err != nil {
 		t.Fatalf("decode req: %v", err)
 	}
-	if !req.Unrestricted {
-		t.Fatal("admin write gate should send read commands through unrestricted edge execution")
+	if req.Unrestricted {
+		t.Fatal("admin write gate must not send read commands through unrestricted edge execution")
 	}
 }
 

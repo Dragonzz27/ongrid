@@ -345,7 +345,11 @@ func (t *BashTool) InvokableRun(ctx context.Context, argsJSON string, opts ...ba
 	defer cancel()
 
 	results := runBatch(batchCtx, in.DeviceIDs, func(ctx context.Context, id uint64) BashResultEntry {
-		return t.singleBash(ctx, id, in.Cmd, in.TimeoutSeconds, hostWriteAllowed)
+		// 写动作开关只决定"能不能生成提案"，不改变下发模式。走到这里说明
+		// 分类器判定为读命令，一旦漏判，也必须以只读模式交给 Edge 的
+		// cmdpolicy，由它 fail closed。只有审批通过后执行的 RunApproved
+		// 才允许 Unrestricted。
+		return t.singleBash(ctx, id, in.Cmd, in.TimeoutSeconds, false)
 	})
 	return marshalBashEnvelope(in.Cmd, results)
 }
