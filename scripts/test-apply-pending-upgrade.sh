@@ -98,4 +98,90 @@ grep -Fxq bundle-plugin "$lib_dir/plugin"
 test ! -e "$stage/pending"
 test ! -e "$stage/pending.sha256"
 
+# A node installed before the ProtectHome=read-only fix keeps ProtectHome=true,
+# because a bundle upgrade only swaps the files listed in MANIFEST.txt and never
+# rewrites the unit. The pre-start hook must migrate exactly that directive and
+# reload systemd, exercised through the real hook entry point.
+unit_dir="$tmp_dir/systemd"
+dropin_dir="$unit_dir/ongrid-edge.service.d"
+unit_file="$unit_dir/ongrid-edge.service"
+sbin="$tmp_dir/sbin"
+systemctl_log="$tmp_dir/systemctl.log"
+logger_log="$tmp_dir/logger.log"
+mkdir -p "$unit_dir" "$dropin_dir" "$sbin"
+
+# Shims keep the test away from the host's systemd and journal while still
+# making the hook's reload and its log lines observable.
+cat > "$sbin/systemctl" <<'SHIM'
+#!/bin/sh
+printf '%s\n' "$*" >> "$ONGRID_EDGE_SYSTEMCTL_LOG"
+SHIM
+cat > "$sbin/logger" <<'SHIM'
+#!/bin/sh
+printf '%s\n' "$*" >> "$ONGRID_EDGE_LOGGER_LOG"
+SHIM
+chmod 0755 "$sbin/systemctl" "$sbin/logger"
+
+run_hook_with_unit() {
+  ONGRID_EDGE_UNIT_FILE="$unit_file" \
+  ONGRID_EDGE_DROPIN_DIR="$dropin_dir" \
+  ONGRID_EDGE_SYSTEMCTL_LOG="$systemctl_log" \
+  ONGRID_EDGE_LOGGER_LOG="$logger_log" \
+  PATH="$sbin:$PATH" \
+    bash "$hook"
+}
+
+cat > "$unit_file" <<'UNIT'
+[Unit]
+Description=Ongrid Edge
+[Service]
+User=ongrid-edge
+ProtectSystem=strict
+ProtectHome=true
+LimitNOFILE=65536
+Environment=ONGRID_EDGE_CUSTOM=keep-me
+UNIT
+: > "$systemctl_log"
+: > "$logger_log"
+
+# The operator's own drop-in is reported, never rewritten.
+printf '[Service]\nProtectHome=true\n' > "$dropin_dir/override.conf"
+run_hook_with_unit
+grep -Fxq 'ProtectHome=read-only' "$unit_file"
+grep -Fxq 'ProtectSystem=strict' "$unit_file"
+grep -Fxq 'LimitNOFILE=65536' "$unit_file"
+grep -Fxq 'Environment=ONGRID_EDGE_CUSTOM=keep-me' "$unit_file"
+grep -Fxq 'ProtectHome=true' "$dropin_dir/override.conf"
+grep -q 'still pins ProtectHome=true' "$logger_log"
+test "$(grep -c 'daemon-reload' "$systemctl_log")" -eq 1
+
+# Running the same upgrade again changes nothing and does not reload again.
+cp "$unit_file" "$tmp_dir/unit.after-first"
+run_hook_with_unit
+cmp -s "$unit_file" "$tmp_dir/unit.after-first"
+test "$(grep -c 'daemon-reload' "$systemctl_log")" -eq 1
+
+# Only the stale value is migrated: an operator who chose ProtectHome=false, or
+# a unit without the directive at all, must come back byte-identical.
+printf '[Service]\nProtectHome=false\n' > "$unit_file"
+cp "$unit_file" "$tmp_dir/unit.disabled"
+run_hook_with_unit
+grep -Fxq 'ProtectHome=false' "$unit_file"
+cmp -s "$unit_file" "$tmp_dir/unit.disabled"
+printf '[Service]\nProtectSystem=strict\n' > "$unit_file"
+run_hook_with_unit
+grep -Fxq 'ProtectSystem=strict' "$unit_file"
+test "$(grep -c 'daemon-reload' "$systemctl_log")" -eq 1
+
+# The spelling of the stale value varies across installs, so match it the way
+# systemd does: any case, with optional surrounding spaces.
+printf '[Service]\nProtectHome = True\n' > "$unit_file"
+run_hook_with_unit
+grep -Fxq 'ProtectHome=read-only' "$unit_file"
+
+# A missing unit (package installs without it, or a first boot) is a no-op.
+rm -f "$unit_file"
+run_hook_with_unit
+test ! -e "$unit_file"
+
 echo "apply-pending-upgrade tests passed"
