@@ -394,7 +394,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=true
 ProtectSystem=strict
 # read-only, not true: ProtectHome=true hides /home, /root and /run/user behind
-# an empty tmpfs, so the logs plugin's promtail subprocess silently finds no
+# an empty tmpfs, so the logs plugin's otelcol-contrib filelog receiver finds no
 # files there and collects nothing. read-only keeps those paths unwritable while
 # they stay readable.
 ProtectHome=read-only
