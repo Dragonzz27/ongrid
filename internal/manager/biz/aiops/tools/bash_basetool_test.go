@@ -204,11 +204,20 @@ func TestBashTool_RedirectAndCommandListUseApproval(t *testing.T) {
 	}
 }
 
-// 纯读的命令列表与管道不应该被拖进审批；同时验证下发一律是只读模式。
+// 纯读的管道命令不应该被拖进审批。这里的下发结果由真实的 Edge 策略算出来，
+// 保证"判成读"的命令在只读模式下确实可执行，而不只是证明下发了只读模式。
 func TestBashTool_ReadPipelineDispatchesReadOnly(t *testing.T) {
-	for _, cmd := range []string{"ps aux | grep ongrid", "df -h && free -m", "docker images | head -5"} {
+	policy := cmdpolicy.DefaultReadOnly()
+	for _, cmd := range []string{"ps aux | grep ongrid", "df -h | head -5", "cat /etc/hosts", "ls -l /var/log | tail -5"} {
 		t.Run(cmd, func(t *testing.T) {
-			fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: true, Stdout: "ok"})}
+			if _, err := cmdpolicy.SplitPipes(cmd); err != nil {
+				t.Fatalf("%q dispatched read-only but the edge parser rejects its syntax: %v", cmd, err)
+			}
+			decision := policy.Decide(cmd)
+			if !decision.Allow {
+				t.Fatalf("%q dispatched read-only but the edge policy denies it: %s", cmd, decision.Reason)
+			}
+			fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: decision.Allow, Stdout: "ok"})}
 			prop := &recHostBashProposer{}
 			tool := &BashTool{caller: fc, resolver: &fakeHostFilesResolver{mapping: map[uint64]uint64{1: 7}}, proposer: prop}
 			ctx := basetool.WithHostWriteAllowed(context.Background(), true)
@@ -236,6 +245,72 @@ func TestBashTool_ReadPipelineDispatchesReadOnly(t *testing.T) {
 	}
 }
 
+// Edge 的解析器只接受简单命令与裸管道。写开关开启时，它拒绝的复合语法必须
+// 生成审批提案——判成读等于把它们下发成注定被拒的调用。断言直接跑真实的
+// cmdpolicy，避免写死的 Allowed 响应只证明下发模式、证明不了可执行。
+func TestBashTool_EdgeUnsupportedOperatorsRequireApproval(t *testing.T) {
+	policy := cmdpolicy.DefaultReadOnly()
+	for _, cmd := range []string{
+		"df -h && free -m",
+		"df -h || free -m",
+		"df -h; free -m",
+		"df -h &",
+		"cat /etc/hostname < /tmp/f",
+		"echo ${HOME}",
+		"diff <(sort /tmp/a) <(sort /tmp/b)",
+		"docker system df 2>/dev/null && free -m",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, err := cmdpolicy.SplitPipes(cmd); err == nil {
+				t.Fatalf("expected the edge parser to reject %q", cmd)
+			}
+			if !isHostBashWriteCommand(cmd) {
+				t.Fatalf("%q must be classified as needing approval", cmd)
+			}
+			decision := policy.Decide(cmd)
+			if decision.Allow || !strings.Contains(decision.Reason, "forbidden") {
+				t.Fatalf("%q should be rejected for a forbidden operator, got allow=%v reason=%q", cmd, decision.Allow, decision.Reason)
+			}
+			fc := &fakeCaller{respBody: mustMarshal(tunnel.BashExecResponse{Allowed: decision.Allow, Reason: decision.Reason})}
+			prop := &recHostBashProposer{}
+			tool := &BashTool{caller: fc, resolver: &fakeHostFilesResolver{mapping: map[uint64]uint64{1: 7}}, proposer: prop}
+			ctx := basetool.WithHostWriteAllowed(context.Background(), true)
+			payload, err := json.Marshal(map[string]any{"device_ids": []uint64{1}, "cmd": cmd})
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			if _, err := tool.InvokableRun(ctx, string(payload)); err != nil {
+				t.Fatalf("InvokableRun: %v", err)
+			}
+			if !prop.called {
+				t.Fatalf("%q must create an approval proposal", cmd)
+			}
+			if prop.command != cmd {
+				t.Fatalf("proposal carried %q, want the exact command %q", prop.command, cmd)
+			}
+			if fc.lastName != "" {
+				t.Fatalf("%q dispatched before approval, method %q", cmd, fc.lastName)
+			}
+		})
+	}
+}
+
+// 换行是这类语法的特例：Edge 把它当空白，不报语法错，而是把两条命令粘成一条
+// argv。所以分类器必须判成需要审批，否则模型看到的"成功"跑的其实是另一条命令。
+func TestBashTool_NewlineSeparatedCommandsRequireApproval(t *testing.T) {
+	const cmd = "df -h\nfree -m"
+	segments, err := cmdpolicy.SplitPipes(cmd)
+	if err != nil {
+		t.Fatalf("the edge parser should accept the newline as whitespace: %v", err)
+	}
+	if len(segments) != 1 || len(segments[0]) != 4 {
+		t.Fatalf("expected the newline to join both commands into one 4-token argv, got %#v", segments)
+	}
+	if !isHostBashWriteCommand(cmd) {
+		t.Fatalf("%q must require approval instead of running as a joined argv", cmd)
+	}
+}
+
 func TestIsHostBashWriteCommand(t *testing.T) {
 	cases := []struct {
 		cmd  string
@@ -259,11 +334,24 @@ func TestIsHostBashWriteCommand(t *testing.T) {
 		{"ls; rm -f /tmp/x", true},
 		{"true && rm -f /tmp/x", true},
 		{"rm -f /tmp/x || true", true},
-		{"sleep 5 &", false},
 		{"ls -l & rm /tmp/x", true},
 		// 管道里的写命令
 		{"cat /etc/hosts | tee /tmp/copy", true},
 		{"ps aux | head -5", false},
+		// 只读命令列表同样是问题：Edge 的解析器根本不接受 ; && || &，
+		// 按只读段逐段判断会把它们下发成注定被拒的调用，所以一律走审批。
+		{"df -h && free -m", true},
+		{"df -h || free -m", true},
+		{"df -h; free -m", true},
+		{"df -h &", true},
+		{"sleep 5 &", true},
+		// 换行被 Edge 当成空白，会把两条命令粘成一条 argv，同样只能走审批。
+		{"df -h\nfree -m", true},
+		// 输入重定向、参数展开、括号：Edge 一律判 forbidden。
+		{"cat /etc/hostname < /tmp/f", true},
+		{"echo ${HOME}", true},
+		{"echo \"${HOME}\"", true},
+		{"diff <(sort /tmp/a) <(sort /tmp/b)", true},
 		// 命令替换：内容不可预测
 		{"echo $(rm -f /tmp/y)", true},
 		{"echo `rm -f /tmp/y`", true},
@@ -272,6 +360,9 @@ func TestIsHostBashWriteCommand(t *testing.T) {
 		{`echo "a > b"`, false},
 		{`echo 'a; rm b'`, false},
 		{`echo "hello && world"`, false},
+		{`echo 'a && b'`, false},
+		{`echo "a; b"`, false},
+		{`echo "a < b"`, false},
 		// 前导赋值与 sudo 选项不能顶掉命令名
 		{"LC_ALL=C rm -f /tmp/x", true},
 		{"FOO=1 BAR=2 mv a b", true},

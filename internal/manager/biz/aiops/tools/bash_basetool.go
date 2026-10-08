@@ -387,9 +387,14 @@ func isHostBashWriteCommand(cmd string) bool {
 }
 
 // splitHostShellCommands 按 shell 分隔符把命令切成多个简单命令段，并报告是否
-// 出现输出重定向或命令替换。这两类语法本身就足以产生任意副作用，无法靠命令名
-// 判断。引号内的分隔符不算语法：单引号内是字面量；双引号内的 $( ) 与反引号仍会
-// 执行，所以按风险处理。
+// 出现 Edge 侧无法执行的语法。risky 的判据取自 internal/edgeagent/cmdpolicy 的
+// 解析器：它只接受简单命令与裸管道，其余一律拒绝，所以这些语法必须走审批，
+// 不能以只读模式下发后被 Edge 拒掉（那会让原本能执行的命令直接失效）。
+// 被标为 risky 的有：输出/输入重定向、命令替换 $() 与反引号、参数展开 ${}、
+// 子 shell 与进程替换的括号、命令列表符 ; 与 && 与 ||、后台执行 &，以及换行
+// （Edge 把换行当空白，会把两条命令粘成一条 argv）。引号内的分隔符不算语法：
+// 单引号内是字面量；双引号内的 $( )、${ } 与反引号仍会执行，所以按风险处理。
+// 裸 | 是唯一双方都支持的复合语法，继续只切段不判写。
 func splitHostShellCommands(cmd string) ([]string, bool) {
 	var segments []string
 	var buf []rune
@@ -415,8 +420,8 @@ func splitHostShellCommands(cmd string) ([]string, bool) {
 			i++
 			continue
 		}
-		// 命令替换在双引号内同样会执行。
-		if c == '`' || (c == '$' && i+1 < len(runes) && runes[i+1] == '(') {
+		// 命令替换与参数展开在双引号内同样会执行或被 Edge 拒绝。
+		if c == '`' || (c == '$' && i+1 < len(runes) && (runes[i+1] == '(' || runes[i+1] == '{')) {
 			risky = true
 		}
 		if inDouble {
@@ -432,18 +437,32 @@ func splitHostShellCommands(cmd string) ([]string, bool) {
 		case '"':
 			inDouble = true
 		case ';', '\n':
-			flush()
-		case '|', '&':
-			// 吃掉 && 与 || 的第二个字符，避免多切出一个空段。
-			if i+1 < len(runes) && runes[i+1] == c {
-				i++
-			}
-			flush()
-		case '>':
+			// 命令列表符 ; 与换行：前者被 Edge 判为 forbidden，后者被当成空白把两条
+			// 命令粘成一条 argv。两者都不能按只读段逐段判断。
 			risky = true
 			flush()
-		case '<':
+		case '|':
+			// || 是逻辑或，被 Edge 拒绝；裸 | 是双方都支持的管道，只切段不判写。
+			if i+1 < len(runes) && runes[i+1] == '|' {
+				i++
+				risky = true
+			}
 			flush()
+		case '&':
+			// && 与后台 & 都被 Edge 拒绝，吃掉 && 的第二个字符避免多切一个空段。
+			if i+1 < len(runes) && runes[i+1] == '&' {
+				i++
+			}
+			risky = true
+			flush()
+		case '>', '<':
+			// 输出重定向必然改文件；输入重定向同样被 Edge 一律拒绝。
+			risky = true
+			flush()
+		case '(', ')':
+			// 子 shell / 进程替换：Edge 的解析器直接拒绝，留在段里供诊断。
+			risky = true
+			buf = append(buf, c)
 		default:
 			buf = append(buf, c)
 		}
