@@ -197,13 +197,21 @@ func (u *Usecase) SilenceIncident(ctx context.Context, id, operatorUserID uint64
 		return err
 	}
 	matchers := `[]`
+	var deviceID *uint64
 	if incident.DeviceID != nil {
 		matchers = fmt.Sprintf(`[{"field":"device_id","operator":"=","value":"%d"}]`, *incident.DeviceID)
+		id := *incident.DeviceID
+		deviceID = &id
 	}
 	reasonCopy := reason
+	// silenceMatches treats empty fields as wildcards, so the row must carry
+	// the incident's device and rule; scope_type alone would mute every
+	// incident of that scope.
 	if err := u.repo.CreateSilence(ctx, &model.Silence{
 		Name:         buildSilenceName(incident),
 		ScopeType:    incident.ScopeType,
+		DeviceID:     deviceID,
+		Rule:         incident.Rule,
 		Status:       model.SilenceStatusActive,
 		MatchersJSON: matchers,
 		Reason:       &reasonCopy,
