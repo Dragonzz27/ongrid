@@ -17,6 +17,10 @@ import (
 // arbitrary argv/script.
 type ShellRunner struct{}
 
+// pipeWaitDelay bounds how long Run waits for stdout/stderr to close after
+// the child exits or is killed (exec.Cmd.WaitDelay).
+const pipeWaitDelay = time.Second
+
 // NewShellRunner builds the shell backend.
 func NewShellRunner() *ShellRunner { return &ShellRunner{} }
 
@@ -49,6 +53,11 @@ func (r *ShellRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 	} else {
 		cmd = exec.CommandContext(cctx, spec.Argv[0], spec.Argv[1:]...)
 	}
+	// On timeout kill the whole process group, not just the shell; and once
+	// the child exits, stop waiting for background descendants that still
+	// hold stdout/stderr open.
+	configureProcessGroup(cmd)
+	cmd.WaitDelay = pipeWaitDelay
 
 	// Working dir: caller-supplied (must exist) or a transient temp dir.
 	workdir := spec.Workdir
@@ -95,6 +104,11 @@ func (r *ShellRunner) Run(ctx context.Context, spec Spec) (Result, error) {
 		if errors.As(runErr, &ee) {
 			res.ExitCode = ee.ExitCode()
 			return res, nil // non-zero exit is a result, not a runner error
+		}
+		if errors.Is(runErr, exec.ErrWaitDelay) {
+			// Exited 0, but a background descendant kept the output pipes
+			// open past pipeWaitDelay; its later output is dropped.
+			return res, nil
 		}
 		return res, fmt.Errorf("runner: exec: %w", runErr)
 	}
